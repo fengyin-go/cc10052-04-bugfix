@@ -87,12 +87,23 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)
     entry, missing = service.create_entry(payload.values)
     if missing:
-        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+        reason = "、".join(missing)
+        # 基类缺字段校验返回的都是必填字段名；领域服务的禁建提示则原样透出。
+        is_field_validation = bool(missing) and all(
+            f in service.REQUIRED_FIELDS for f in missing
+        )
+        message = f"缺少必填字段：{reason}" if is_field_validation else reason
+        return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    context = {
+        "request_id": payload.request_id,
+        "remark": payload.remark,
+        "values": payload.values,
+    }
+    entry, message = service.run_action(entry_id, payload.action.strip(), context)
     return ActionResult(ok=entry is not None, message=message, entry=entry)

@@ -1,9 +1,12 @@
 """模块服务基类：共享查询、登记、动作和统计骨架，业务差异留在各模块文件。"""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from app.store import store
+
+# 自定义动作处理器签名：(记录 id, 动作附加上下文) -> (记录或 None, 提示语)
+ActionHandler = Callable[[int, dict[str, Any]], tuple[dict[str, Any] | None, str]]
 
 
 class BaseModuleService:
@@ -14,6 +17,8 @@ class BaseModuleService:
     STATUS_ORDER: list[str] = []
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
+    # 动作名 -> 领域处理器；命中时走真实业务流转（含跨模块交接），不再做通用状态翻转。
+    ACTION_HANDLERS: dict[str, str] = {}
 
     def list_entries(
         self,
@@ -59,10 +64,20 @@ class BaseModuleService:
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        context: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        handler_name = self.ACTION_HANDLERS.get(action)
+        if handler_name is not None:
+            handler = getattr(self, handler_name, None)
+            if callable(handler):
+                return handler(entry_id, context or {})
         target = self.ACTION_RULES.get(action)
         if target is None:
             return None, f"动作「{action}」不属于{self.MODULE}可执行范围"

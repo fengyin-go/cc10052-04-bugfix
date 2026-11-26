@@ -64,6 +64,8 @@ npm run dev
 | 数据时效监控 | `data_freshness` | 时效记录 | 监控对象、数据域、最新水位 |
 | 指标异常检测 | `anomaly_metric` | 异常事件 | 异常编号、指标编码、基线区间 |
 | 实验归档库 | `exp_archive` | 归档实验 | 实验编码、结束时间、结论摘要 |
+| 结束交接单 | `finish_handoff` | 结束申请 | 结束申请号、实验编码、轮次号、归档号 |
+| 结论修订 | `conclusion_revision` | 结论修订 | 修订编号、归档号、修订内容、确认批次 |
 | 样本量核对 | `sample_ratio` | 核对结果 | 核对批次、实验编码、计划比例 |
 | AA预检器 | `aa_check` | AA检验 | 检验编码、实验编码、检验窗口 |
 | 切片分析器 | `segment_slice` | 切片结果 | 切片批次、实验编码、切片维度 |
@@ -77,7 +79,30 @@ npm run dev
 - 每个模块仍保留独立`backend/app/services/<模块>.py`；纯前端保留
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
-- 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 状态流转只允许在 `app/services` 里改，路由层不做业务判断。需要跨模块交接的动作
+  通过服务的 `ACTION_HANDLERS` 声明处理器，由 `run_action` 统一分派。
+
+## 实验结束跨页交接（实验设计 ↔ 实验归档库）
+
+- 只有「运行中」的实验轮次可结束。结束动作按轮次生成唯一「归档号」`AR-<实验编码>-R<轮次>`
+  与「结束申请号」，回写实验方案，并向 `exp_archive` 交接且仅交接一份归档批次。
+- 结束接口按轮次幂等：响应超时/按钮中断后重发（含不同 `request_id`）只取回原结束申请
+  与原归档号，不会产生第二份交接；前端可在「结束交接单」按实验编码或归档号核查。
+- 归档库用同一归档号打开完整归档批次（实验编码、结束时原结论、历史明细），「执行归档」
+  领取、「恢复实验」按批次明细重建切片；恢复不回改实验设计侧该轮的结束状态。
+- 晚到结论修订（如 C2）在 `conclusion_revision` 单独登记与确认，不覆盖结束时原结论，
+  每次确认有独立确认批次，可按归档号追到「被哪次结论确认采用」。
+- 跨页固定路径接口：`GET /api/handoffs`、`GET /api/experiments/{编码}/handoffs`、
+  `GET /api/archive-batches/{归档号}`、`POST /api/archive-batches/{归档号}/revisions`。
+
+## 测试
+
+```bash
+# 后端起在 8022 后，运行端到端（HTTP）与服务级（进程内）核查
+python3 -I backend/tests/test_e2e_handoff.py
+python3 -I backend/tests/test_service_rounds.py
+```
+
 
 领域：数据工程
 子方向：数据分析与数据应用

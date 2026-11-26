@@ -6,7 +6,7 @@
         <p class="page-desc">{{ meta.desc }}</p>
       </div>
       <div class="page-actions">
-        <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
+        <button v-if="canCreate" class="btn primary" data-testid="open-create" type="button" @click="openCreate">
           登记{{ meta.entity }}
         </button>
         <button class="btn" data-testid="export" type="button" @click="exportRows">
@@ -50,16 +50,21 @@
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
-            <button
-              v-for="action in meta.actions"
-              :key="action"
-              class="link"
-              type="button"
-              :data-testid="`action-${row.id}-${action}`"
-              @click="runAction(action, row)"
-            >
-              {{ action }}
-            </button>
+            <template v-for="action in meta.actions" :key="action">
+              <button
+                v-if="isActionAvailable(meta.key, row, action)"
+                class="link"
+                type="button"
+                :data-testid="`action-${row.id}-${action}`"
+                :disabled="busyKey === busyIdOf(row, action)"
+                @click="runAction(action, row)"
+              >
+                {{ busyKey === busyIdOf(row, action) ? '提交中…' : action }}
+              </button>
+            </template>
+            <span v-if="!meta.actions.some((a) => isActionAvailable(meta.key, row, a))" class="muted-text">
+              无可执行动作
+            </span>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -70,10 +75,13 @@
       </tbody>
     </table>
 
+    <HandoffPanel v-if="showHandoffPanel" ref="handoffPanel" />
+    <ArchiveBatchPanel v-if="meta.key === 'exp_archive'" ref="archivePanel" />
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
-        <label v-for="field in meta.fields" :key="field" class="create-field">
+        <label v-for="field in createFieldList" :key="field" class="create-field">
           <span>{{ field }}</span>
           <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
         </label>
@@ -88,7 +96,8 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span v-if="successMessage" class="ok-text" data-testid="success-message">{{ successMessage }}</span>
+      <span v-if="errorMessage" class="error-text" data-testid="error-message">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
@@ -96,6 +105,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 
+import ArchiveBatchPanel from '@/components/ArchiveBatchPanel.vue'
+import HandoffPanel from '@/components/HandoffPanel.vue'
 import {
   createEntry,
   downloadEntries,
@@ -103,6 +114,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import { isActionAvailable, newFinishRequestId } from '@/domain/exp_design'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -110,11 +122,26 @@ const meta = moduleMeta(props.moduleKey)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const successMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const busyKey = ref('')
+const handoffPanel = ref<InstanceType<typeof HandoffPanel> | null>(null)
+const archivePanel = ref<InstanceType<typeof ArchiveBatchPanel> | null>(null)
+
+const showHandoffPanel = computed(
+  () => props.moduleKey === 'exp_design' || props.moduleKey === 'exp_archive',
+)
+// 结束交接单是系统自动登记的只读凭证；结论修订须在归档批次面板登记，均不开放通用登记。
+const canCreate = computed(
+  () => props.moduleKey !== 'finish_handoff' && props.moduleKey !== 'conclusion_revision',
+)
+// 登记表单只收集业务可填字段，轮次号/归档号等系统字段不出现。
+const createFieldList = computed(() => meta.createFields ?? meta.fields)
+
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -129,6 +156,10 @@ const statusSummary = computed(() =>
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+function busyIdOf(row: EntryRow, action: string): string {
+  return `${row.id}-${action}`
+}
 
 function resetFilters() {
   filters.value = {}
@@ -145,7 +176,7 @@ async function exportRows() {
 }
 
 function openCreate() {
-  createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
+  createValues.value = Object.fromEntries(createFieldList.value.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
 }
@@ -167,12 +198,33 @@ async function submitCreate() {
 
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
+  successMessage.value = ''
+  const key = busyIdOf(row, action)
+  busyKey.value = key
+  // 结束实验附带客户端请求标识；服务端按轮次幂等，重发不会重复交接。
+  const extra =
+    meta.key === 'exp_design' && action === '结束实验'
+      ? { requestId: newFinishRequestId(String(row.实验编码), Number(row.轮次号) || 1) }
+      : {}
   try {
-    const result = await applyAction(meta.key, Number(row.id), action)
+    const result = await applyAction(meta.key, Number(row.id), action, extra)
     if (!result.ok) throw new Error(result.message)
+    const archiveNo = result.entry?.归档号
+    successMessage.value =
+      action === '结束实验' && archiveNo
+        ? `${result.message}（归档号：${archiveNo}，可在下方交接面板核查）`
+        : result.message
     await reload()
+    if (showHandoffPanel.value) void handoffPanel.value?.load()
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '操作失败'
+    // 按钮等候中断（超时/网络异常）：引导用户核查已受理的结束申请及归档号。
+    const base = error instanceof Error ? error.message : '操作失败'
+    errorMessage.value =
+      action === '结束实验'
+        ? `${base}。结束申请可能已受理，请在下方「结束申请核查」按实验编码或归档号确认，勿重复提交。`
+        : base
+  } finally {
+    busyKey.value = ''
   }
 }
 
@@ -187,5 +239,22 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  void reload()
+  if (showHandoffPanel.value) void handoffPanel.value?.load()
+})
 </script>
+
+<style scoped>
+.muted-text {
+  color: var(--muted);
+  font-size: 12px;
+}
+.ok-text {
+  color: #15803d;
+}
+.link:disabled {
+  color: var(--muted);
+  cursor: wait;
+}
+</style>
